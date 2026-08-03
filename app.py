@@ -8,6 +8,7 @@ import signal
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,10 @@ EARLY_STREAK = int(os.getenv("EARLY_STREAK", "2"))
 CONFIRMED_STREAK = int(os.getenv("CONFIRMED_STREAK", "2"))
 DIRECTION_GAP = float(os.getenv("DIRECTION_GAP", "7"))
 MAX_EXTENSION_ATR = float(os.getenv("MAX_EXTENSION_ATR", "0.75"))
+STATE_HISTORY = int(os.getenv("STATE_HISTORY", "8"))
+MIN_PERSISTENCE = int(os.getenv("MIN_PERSISTENCE", "3"))
+SMART_SCORE = float(os.getenv("SMART_SCORE", "72"))
+INVALIDATION_STREAK = int(os.getenv("INVALIDATION_STREAK", "3"))
 
 DB_PATH = os.getenv("DB_PATH", "data/early_explosion.db")
 SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "true").lower() == "true"
@@ -552,6 +557,89 @@ def choose_stage(scores: dict[str,float], f15: dict, f1: dict, f4: dict) -> str 
     return None
 
 
+
+def trend_slope(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    n = len(values)
+    x_mean = (n - 1) / 2
+    y_mean = sum(values) / n
+    num = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values))
+    den = sum((i - x_mean) ** 2 for i in range(n))
+    return num / den if den else 0.0
+
+
+def persistence_score(history: list[dict], direction: str) -> dict[str, float]:
+    if len(history) < 2:
+        return {
+            "persistence": 0.0,
+            "oi_accel": 50.0,
+            "book_persistence": 50.0,
+            "delta_persistence": 50.0,
+            "compression_persistence": 50.0,
+            "smart_score": 50.0,
+        }
+
+    sign = 1 if direction == "BUY" else -1
+    oi_vals = [float(x.get("oi_change", 0.0)) for x in history]
+    book_vals = [float(x.get("imbalance_raw", 0.0)) * sign for x in history]
+    delta_vals = [float(x.get("delta_strength", 50.0)) for x in history]
+    compression_vals = [float(x.get("compression", 50.0)) for x in history]
+
+    positive_book = sum(v > 0.04 for v in book_vals) / len(book_vals)
+    positive_delta = sum(v >= 56 for v in delta_vals) / len(delta_vals)
+    compressed = sum(v >= 55 for v in compression_vals) / len(compression_vals)
+    oi_positive = sum(v > 0.05 for v in oi_vals) / len(oi_vals)
+
+    persistence = 100 * (
+        0.30 * positive_book
+        + 0.30 * positive_delta
+        + 0.20 * compressed
+        + 0.20 * oi_positive
+    )
+
+    oi_slope = trend_slope(oi_vals)
+    book_slope = trend_slope(book_vals)
+    delta_slope = trend_slope(delta_vals)
+
+    oi_accel = clamp(50 + oi_slope * 35)
+    book_persistence = clamp(50 + positive_book * 35 + book_slope * 120)
+    delta_persistence = clamp(45 + positive_delta * 40 + delta_slope * 1.5)
+    compression_persistence = clamp(40 + compressed * 45)
+
+    smart_score = clamp(
+        0.34 * persistence
+        + 0.18 * oi_accel
+        + 0.20 * book_persistence
+        + 0.20 * delta_persistence
+        + 0.08 * compression_persistence
+    )
+
+    return {
+        "persistence": persistence,
+        "oi_accel": oi_accel,
+        "book_persistence": book_persistence,
+        "delta_persistence": delta_persistence,
+        "compression_persistence": compression_persistence,
+        "smart_score": smart_score,
+    }
+
+
+def is_invalidated(sig: Signal) -> bool:
+    d = sig.details
+    ob = d.get("orderbook", {})
+    f15 = d.get("features_15m", {})
+    oi15 = d.get("oi_15m", {})
+    if sig.direction == "BUY":
+        book_bad = ob.get("imbalance_raw", 0) < -0.08
+        delta_bad = f15.get("delta_strength", 50) < 42
+    else:
+        book_bad = ob.get("imbalance_raw", 0) > 0.08
+        delta_bad = f15.get("delta_strength", 50) < 42
+    oi_bad = oi15.get("oi_change", 0) < -0.35
+    return sum((book_bad, delta_bad, oi_bad)) >= 2
+
+
 # =========================================================
 # تيليجرام
 # =========================================================
@@ -606,6 +694,7 @@ def signal_message(sig: Signal) -> str:
 🧠 درجة الانفجار: <b>{sig.explosion_score:.1f}%</b>
 🎯 جودة الدخول: <b>{sig.entry_score:.1f}%</b>
 🛡️ درجة الأمان: <b>{sig.safety_score:.1f}%</b>
+🧬 بصمة الأموال الذكية: <b>{sig.details.get("smart_persistence", {}).get("smart_score", 0):.1f}%</b>
 📚 الاحتمال التاريخي: <b>{historical}</b>
 
 📊 توافق الفريمات:
@@ -646,6 +735,8 @@ class Engine:
         self.alert_count = 0
         self.stage_streaks: dict[tuple[str, str, str], int] = {}
         self.last_stage_seen: dict[tuple[str, str], str] = {}
+        self.market_history: dict[tuple[str, str], deque] = {}
+        self.invalidation_streaks: dict[tuple[str, str], int] = {}
 
     async def start(self):
         await init_db()
@@ -654,7 +745,7 @@ class Engine:
         if SEND_STARTUP_MESSAGE:
             await send_telegram(
                 self.telegram_session,
-                "✅ <b>Ahmed Early Explosion Trader بدأ العمل</b>\n\n"
+                "✅ <b>Ahmed Early Explosion Trader v3 SMART بدأ العمل</b>\n\n"
                 "الفريمات: 15M / 1H / 4H\n"
                 "المراحل: استعداد مبكر جدًا / استعداد مؤكد / بداية الانفجار\n"
                 "⚠️ لا ينفذ صفقات تلقائيًا."
@@ -726,6 +817,15 @@ class Engine:
                 continue
             analyzed += 1
             for sig in result:
+                inv_key = (sig.symbol, sig.direction)
+                if is_invalidated(sig):
+                    self.invalidation_streaks[inv_key] = self.invalidation_streaks.get(inv_key, 0) + 1
+                else:
+                    self.invalidation_streaks[inv_key] = 0
+
+                if self.invalidation_streaks[inv_key] >= INVALIDATION_STREAK:
+                    continue
+
                 _, changed = await save_signal(sig)
                 if changed:
                     ok = await send_telegram(self.telegram_session, signal_message(sig))
@@ -790,6 +890,33 @@ class Engine:
                 plan_tf["swing_low"], plan_tf["swing_high"], stage
             )
 
+            hist_key = (symbol, direction)
+            hist = self.market_history.setdefault(hist_key, deque(maxlen=STATE_HISTORY))
+            hist.append({
+                "ts": time.time(),
+                "oi_change": o15["oi_change"],
+                "imbalance_raw": ob["imbalance_raw"],
+                "delta_strength": c15["delta_strength"],
+                "cvd_strength": c15["cvd_strength"],
+                "compression": c15["compression"],
+                "volume": c15["volume"],
+                "price": c15["price"],
+            })
+            smart = persistence_score(list(hist), direction)
+
+            # البصمة المستمرة أهم من اللقطة الواحدة.
+            explosion_score = clamp(0.72 * explosion_score + 0.28 * smart["smart_score"])
+            entry_score = clamp(0.82 * entry_score + 0.18 * smart["persistence"])
+            safety_score = clamp(0.78 * safety_score + 0.22 * smart["book_persistence"])
+            score = clamp((explosion_score + entry_score + safety_score) / 3)
+
+            if smart["smart_score"] >= SMART_SCORE:
+                recipe.append(f"بصمة أموال ذكية مستمرة {smart['smart_score']:.1f}%")
+            if smart["oi_accel"] >= 60:
+                recipe.append("تسارع OI مستمر عبر عدة قراءات")
+            if smart["book_persistence"] >= 62:
+                recipe.append("اختلال دفتر الأوامر مستمر وليس لقطة واحدة")
+
             details = {
                 "orderbook": ob,
                 "oi_15m": o15,
@@ -798,7 +925,14 @@ class Engine:
                 "features_15m": c15,
                 "features_1h": c1,
                 "features_4h": c4,
+                "smart_persistence": smart,
             }
+
+            # المرحلة المبكرة تتطلب تاريخًا كافيًا وبصمة مستمرة.
+            if stage == "EARLY":
+                if len(hist) < MIN_PERSISTENCE or smart["smart_score"] < SMART_SCORE:
+                    continue
+
             out.append(Signal(
                 symbol=symbol, direction=direction, stage=stage,
                 score=score, explosion_score=explosion_score,
