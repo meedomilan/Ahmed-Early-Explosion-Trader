@@ -795,7 +795,11 @@ class Engine:
                     await asyncio.sleep(60)
                     continue
 
-                prices = {x["symbol"]: float(x["lastPrice"]) for x in await self.client.get("/fapi/v1/ticker/price")}
+                prices = {
+                    x["symbol"]: float(x["price"])
+                    for x in await self.client.get("/fapi/v1/ticker/price")
+                    if "symbol" in x and "price" in x
+                }
                 async with aiosqlite.connect(DB_PATH) as db:
                     for r in rows:
                         p = prices.get(r["symbol"])
