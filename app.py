@@ -30,7 +30,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 TZ = ZoneInfo(os.getenv("TZ", "Asia/Riyadh"))
 
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "15"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "12"))
 DEEP_CANDIDATES = int(os.getenv("DEEP_CANDIDATES", "120"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "5000000"))
@@ -39,6 +39,10 @@ EARLY_SCORE = float(os.getenv("EARLY_SCORE", "68"))
 CONFIRMED_SCORE = float(os.getenv("CONFIRMED_SCORE", "78"))
 EXPLOSION_SCORE = float(os.getenv("EXPLOSION_SCORE", "86"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "180"))
+EARLY_STREAK = int(os.getenv("EARLY_STREAK", "2"))
+CONFIRMED_STREAK = int(os.getenv("CONFIRMED_STREAK", "2"))
+DIRECTION_GAP = float(os.getenv("DIRECTION_GAP", "7"))
+MAX_EXTENSION_ATR = float(os.getenv("MAX_EXTENSION_ATR", "0.75"))
 
 DB_PATH = os.getenv("DB_PATH", "data/early_explosion.db")
 SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "true").lower() == "true"
@@ -401,6 +405,8 @@ def candle_features(rows: list[list[Any]], direction: str) -> dict[str, float]:
     near_down = safe_div(price - min(lows[-8:-1]), a, 99) < 0.35
 
     price_move = pct_change(closes[-1], closes[-4])
+    compression_mid = (max(highs[-6:]) + min(lows[-6:])) / 2
+    extension_atr = safe_div(abs(price - compression_mid), a, 0.0)
     cvd_div = (cvd > cvd_prev and abs(price_move) < 0.8) if direction == "BUY" else (cvd < cvd_prev and abs(price_move) < 0.8)
 
     signed_delta = delta_now if direction == "BUY" else -delta_now
@@ -423,6 +429,8 @@ def candle_features(rows: list[list[Any]], direction: str) -> dict[str, float]:
         "breakout": 100.0 if breakout else (72.0 if near_break else 25.0),
         "is_breakout": breakout,
         "near_break": near_break,
+        "extension_atr": extension_atr,
+        "price_move_pct": price_move,
         "swing_low": min(lows[-12:]),
         "swing_high": max(highs[-12:]),
     }
@@ -472,10 +480,11 @@ def funding_features(data: dict, direction: str) -> dict[str, float]:
 
 
 def combine_score(c: dict, ob: dict, oi: dict, fund: dict, tf: str) -> float:
+    # الأوزان تركز على الدلتا/CVD/OI/الدفتر قبل الكسر.
     weights = {
-        "15m": (0.20,0.13,0.10,0.13,0.12,0.12,0.08,0.08,0.04),
-        "1h":  (0.17,0.12,0.10,0.11,0.13,0.12,0.12,0.09,0.04),
-        "4h":  (0.14,0.10,0.09,0.09,0.14,0.10,0.17,0.13,0.04),
+        "15m": (0.22,0.17,0.12,0.15,0.13,0.08,0.05,0.04,0.04),
+        "1h":  (0.19,0.15,0.11,0.13,0.14,0.09,0.09,0.06,0.04),
+        "4h":  (0.14,0.11,0.08,0.10,0.13,0.08,0.18,0.14,0.04),
     }[tf]
     vals = [
         c["delta_strength"], c["cvd_strength"], c["cvd_divergence"],
@@ -483,7 +492,12 @@ def combine_score(c: dict, ob: dict, oi: dict, fund: dict, tf: str) -> float:
         c["trend"], c["breakout"], fund["funding_score"],
     ]
     score = sum(w*v for w,v in zip(weights, vals))
-    score -= ob["spoof_risk"] * 0.10
+
+    # مكافأة الضغط المبكر، وعقوبة مخاطرة الأوامر الوهمية ومطاردة الحركة.
+    score += c["compression"] * (0.07 if tf == "15m" else 0.03)
+    score += ob["absorption"] * (0.05 if tf == "15m" else 0.02)
+    score -= ob["spoof_risk"] * 0.12
+    score -= clamp((c.get("extension_atr", 0.0) - 0.45) * 35, 0, 18)
     return clamp(score)
 
 
@@ -509,20 +523,32 @@ def build_trade_plan(direction: str, price: float, a: float, swing_low: float, s
 
 
 def choose_stage(scores: dict[str,float], f15: dict, f1: dict, f4: dict) -> str | None:
+    """
+    EARLY: قبل الكسر، يعتمد على التدفق والضغط فقط.
+    CONFIRMED: اقتراب من الكسر مع استمرار 15m و1h.
+    EXPLOSION: بداية الكسر، بشرط ألا تكون الحركة ممتدة.
+    """
     s15, s1, s4 = scores["15m"], scores["1h"], scores["4h"]
     breakout = f15["is_breakout"] or f1["is_breakout"]
-    volume_expansion = max(f15["vol_ratio"], f1["vol_ratio"]) >= 1.35
+    near_break = f15["near_break"] or f1["near_break"]
+    volume_expansion = max(f15["vol_ratio"], f1["vol_ratio"]) >= 1.22
 
-    explosion = 0.45*s15 + 0.40*s1 + 0.15*s4
-    confirmed = 0.35*s15 + 0.50*s1 + 0.15*s4
-    early = 0.60*s15 + 0.25*s1 + 0.15*s4
+    explosion = 0.52*s15 + 0.36*s1 + 0.12*s4
+    confirmed = 0.46*s15 + 0.42*s1 + 0.12*s4
+    early = 0.72*s15 + 0.20*s1 + 0.08*s4
 
-    if explosion >= EXPLOSION_SCORE and breakout and volume_expansion:
+    # لا نطارد شمعة تحركت كثيرًا بالفعل.
+    extension_atr = max(f15.get("extension_atr", 0.0), f1.get("extension_atr", 0.0))
+    if breakout and volume_expansion and explosion >= EXPLOSION_SCORE and extension_atr <= MAX_EXTENSION_ATR:
         return "EXPLOSION"
-    if confirmed >= CONFIRMED_SCORE and s15 >= 65 and s1 >= 72:
+
+    if confirmed >= CONFIRMED_SCORE and s15 >= 69 and s1 >= 67 and (near_break or volume_expansion):
         return "CONFIRMED"
+
+    # لا يوجد شرط كسر في المرحلة المبكرة.
     if early >= EARLY_SCORE and s15 >= EARLY_SCORE:
         return "EARLY"
+
     return None
 
 
@@ -555,16 +581,16 @@ async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
 
 def signal_message(sig: Signal) -> str:
     stage_title = {
-        "EARLY": "🟡 استعداد مبكر جدًا",
-        "CONFIRMED": "🟠 استعداد مؤكد",
-        "EXPLOSION": "🔥 بداية الانفجار",
+        "EARLY": "🟡 رصد تجميع/تصريف مبكر",
+        "CONFIRMED": "🟠 اقتراب الانفجار",
+        "EXPLOSION": "🔥 بدأ الاشتعال",
     }[sig.stage]
     side = "شراء" if sig.direction == "BUY" else "بيع"
     checks = "\n".join(f"✅ {html.escape(x)}" for x in sig.recipe[:6])
     action = {
-        "EARLY": "👀 الحالة: مراقبة فقط — ليست دخولًا مباشرًا",
-        "CONFIRMED": "📍 الحالة: منطقة دخول مقترحة",
-        "EXPLOSION": "⚡ الحالة: دخول الآن أو انتظار إعادة الاختبار القصير",
+        "EARLY": "👀 الحالة: رصد مبكر قبل الكسر — مراقبة دقيقة",
+        "CONFIRMED": "📍 الحالة: اقتراب من الكسر — منطقة دخول مقترحة",
+        "EXPLOSION": "⚡ الحالة: بدأ الاشتعال ولم تمتد الحركة بعد",
     }[sig.stage]
     historical = "يتعلم"
     tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sig.symbol}.P"
@@ -618,6 +644,8 @@ class Engine:
         self.symbol_count = 0
         self.candidate_count = 0
         self.alert_count = 0
+        self.stage_streaks: dict[tuple[str, str, str], int] = {}
+        self.last_stage_seen: dict[tuple[str, str], str] = {}
 
     async def start(self):
         await init_db()
@@ -781,7 +809,29 @@ class Engine:
                 rr1=plan[6], rr2=plan[7], rr3=plan[8],
                 recipe=recipe, details=details,
             ))
-        return out
+
+        # لا نرسل شراء وبيع لنفس العملة معًا. نختار الاتجاه الأقوى فقط.
+        if len(out) == 2:
+            out.sort(key=lambda x: x.explosion_score, reverse=True)
+            if out[0].explosion_score - out[1].explosion_score < DIRECTION_GAP:
+                return []
+            out = [out[0]]
+
+        stable = []
+        for sig in out:
+            key = (sig.symbol, sig.direction, sig.stage)
+            self.stage_streaks[key] = self.stage_streaks.get(key, 0) + 1
+            need = 1 if sig.stage == "EXPLOSION" else (CONFIRMED_STREAK if sig.stage == "CONFIRMED" else EARLY_STREAK)
+            if self.stage_streaks[key] >= need:
+                stable.append(sig)
+
+        # صفّر العدادات المعاكسة للعملة نفسها حتى لا تبقى قديمة.
+        active_keys = {(x.symbol, x.direction, x.stage) for x in out}
+        for key in list(self.stage_streaks):
+            if key[0] == symbol and key not in active_keys:
+                self.stage_streaks[key] = 0
+
+        return stable
 
     async def track_open_positions(self):
         while self.running:
